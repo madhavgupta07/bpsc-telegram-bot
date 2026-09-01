@@ -128,6 +128,10 @@ export class TelegramService {
     return this.call('answerCallbackQuery', body);
   }
 
+  async getChatMember(chatId: TelegramChatId, userId: number): Promise<any> {
+    return this.call('getChatMember', { chat_id: chatId, user_id: userId });
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }

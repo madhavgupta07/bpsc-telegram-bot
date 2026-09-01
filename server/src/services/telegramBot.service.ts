@@ -33,7 +33,25 @@ const HELP_MESSAGE =
 
 type MessageText = Message & { text: string };
 
+const GROUP_QUESTION_TIMEOUT_MS = 10_000;
+
+type GroupMemberScore = {
+  name: string;
+  correct: number;
+  answered: number;
+};
+
+type GroupGame = {
+  quizId: string;
+  questions: any[];
+  currentIndex: number;
+  scores: Map<number, GroupMemberScore>;
+  timer: NodeJS.Timeout | null;
+};
+
 export class TelegramBotHandler {
+  private groupGames = new Map<number, GroupGame>();
+
   async handleUpdate(update: Update): Promise<void> {
     if (update.message) {
       await this.handleMessage(update.message);
@@ -47,6 +65,14 @@ export class TelegramBotHandler {
     const msg = message as MessageText;
     const chatId = msg.chat.id;
     const text = msg.text?.trim() ?? '';
+    const chatType = msg.chat.type;
+
+    const isGroup = chatType === 'group' || chatType === 'supergroup';
+
+    if (isGroup) {
+      await this.handleGroupMessage(msg);
+      return;
+    }
 
     await this.registerUserIfNeeded(msg);
 
@@ -77,7 +103,210 @@ export class TelegramBotHandler {
       await this.handleAnswer(callback, chatId, fromId, data);
     } else if (data === 'finish') {
       await this.handleFinish(callback, chatId, fromId);
+    } else if (data.startsWith('group_answer:')) {
+      await this.handleGroupAnswer(callback, chatId, fromId, data);
     }
+  }
+
+  private async handleGroupMessage(msg: MessageText): Promise<void> {
+    const chatId = msg.chat.id;
+    const text = msg.text?.trim() ?? '';
+
+    if (!text.startsWith('/quiz')) return;
+
+    const fromId = msg.from?.id;
+    if (!fromId) return;
+
+    const isAdmin = await this.isGroupAdmin(chatId, fromId);
+    if (!isAdmin) {
+      await tg.sendMessage(chatId, 'Only group admins can start a quiz in this group.');
+      return;
+    }
+
+    const args = text.replace('/quiz', '').trim();
+    let quiz: any;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(args)) {
+      quiz = await DailyQuiz.findOne({ date: args, status: 'PUBLISHED' })
+        .populate('questions')
+        .lean();
+      if (!quiz) {
+        await tg.sendMessage(chatId, `No published quiz found for ${args}.`);
+        return;
+      }
+    } else {
+      const today = getDateKey();
+      quiz = await findActiveQuizForDate(today);
+      if (!quiz) {
+        await tg.sendMessage(
+          chatId,
+          'No quiz is published for today. Admins can run /quiz YYYY-MM-DD to start a specific published quiz.'
+        );
+        return;
+      }
+    }
+
+    if (!quiz.questions || quiz.questions.length === 0) {
+      await tg.sendMessage(chatId, 'This quiz has no questions to play.');
+      return;
+    }
+
+    await this.startGroupQuiz(chatId, quiz);
+  }
+
+  private async isGroupAdmin(chatId: number, userId: number): Promise<boolean> {
+    try {
+      const member = await tg.getChatMember(chatId, userId);
+      const status = member?.result?.status;
+      return status === 'administrator' || status === 'creator';
+    } catch {
+      return false;
+    }
+  }
+
+  private async startGroupQuiz(chatId: number, quiz: any): Promise<void> {
+    const existing = this.groupGames.get(chatId);
+    if (existing?.timer) clearTimeout(existing.timer);
+    if (existing) this.groupGames.delete(chatId);
+
+    const game: GroupGame = {
+      quizId: String(quiz._id),
+      questions: (quiz.questions ?? []) as any[],
+      currentIndex: 0,
+      scores: new Map(),
+      timer: null,
+    };
+
+    this.groupGames.set(chatId, game);
+    await tg.sendMessage(chatId, `🎮 Group Quiz starting! ${game.questions.length} questions, 10s each.`);
+
+    await this.postGroupQuestion(chatId, game);
+  }
+
+  private async postGroupQuestion(chatId: number, game: GroupGame): Promise<void> {
+    const index = game.currentIndex;
+    const questions = game.questions;
+
+    if (index >= questions.length) {
+      await this.postGroupScoreboard(chatId, game);
+      return;
+    }
+
+    const questionDoc = questions[index];
+    const question =
+      questionDoc._id && questionDoc.question
+        ? questionDoc
+        : await Question.findById(String(questionDoc._id || questionDoc)).lean();
+
+    if (!question || !question.question) {
+      game.currentIndex += 1;
+      await this.postGroupQuestion(chatId, game);
+      return;
+    }
+
+    const optionRows = question.options.map((opt: string, i: number) => [
+      {
+        text: opt,
+        callback_data: `group_answer:${game.quizId}:${index}:${i}`,
+      },
+    ]);
+
+    const text =
+      `📚 Bihar STET Quiz — Question ${index + 1}/${questions.length}\n` +
+      `⏱ You have ${GROUP_QUESTION_TIMEOUT_MS / 1000}s. Tap your answer once!\n\n` +
+      `${question.question}`;
+
+    await tg.sendMessage(chatId, text, {
+      replyMarkup: { inline_keyboard: optionRows },
+    });
+
+    game.timer = setTimeout(() => {
+      game.currentIndex += 1;
+      this.postGroupQuestion(chatId, game).catch(() => undefined);
+    }, GROUP_QUESTION_TIMEOUT_MS);
+  }
+
+  private async handleGroupAnswer(
+    callback: CallbackQuery,
+    chatId: number,
+    fromId: number | undefined,
+    data: string
+  ): Promise<void> {
+    const [, , qIndexStr, optIndexStr] = data.split(':');
+    const qIndex = parseInt(qIndexStr, 10);
+    const optIndex = parseInt(optIndexStr, 10);
+
+    if (fromId === undefined) return;
+
+    const game = this.groupGames.get(chatId);
+    if (!game || qIndex !== game.currentIndex) {
+      await tg.answerCallbackQuery(callback.id!, {
+        text: 'Too late or this question has closed.',
+        showAlert: true,
+      });
+      return;
+    }
+
+    const questionDoc = game.questions[qIndex];
+    const question =
+      questionDoc._id && questionDoc.question
+        ? questionDoc
+        : await Question.findById(String(questionDoc._id || questionDoc)).lean();
+    if (!question) return;
+
+    const selectedOption = question.options?.[optIndex];
+    if (selectedOption === undefined) return;
+
+    const existing = game.scores.get(fromId);
+    if (existing && existing.answered > qIndex) {
+      await tg.answerCallbackQuery(callback.id!, {
+        text: 'You already answered this question.',
+        showAlert: true,
+      });
+      return;
+    }
+
+    const isCorrect = selectedOption === question.correctAnswer;
+
+    await tg.answerCallbackQuery(callback.id!, {
+      text: isCorrect ? '✅ Correct!' : '❌ Incorrect',
+    });
+
+    const member = callback.from;
+    const memberScore = game.scores.get(fromId) ?? {
+      name: member.first_name ?? `User ${fromId}`,
+      correct: 0,
+      answered: 0,
+    };
+
+    memberScore.answered += 1;
+    if (isCorrect) memberScore.correct += 1;
+    game.scores.set(fromId, memberScore);
+  }
+
+  private async postGroupScoreboard(chatId: number, game: GroupGame): Promise<void> {
+    if (game.timer) clearTimeout(game.timer);
+    game.timer = null;
+
+    const sorted = [...game.scores.entries()].sort((a, b) => b[1].correct - a[1].correct);
+
+    let lines: string;
+    if (sorted.length === 0) {
+      lines = '🎯 No one participated this round.';
+    } else {
+      lines = sorted
+        .map(
+          (entry, i) =>
+            `${i + 1}. ${entry[1].name} — ${entry[1].correct} correct`
+        )
+        .join('\n');
+    }
+
+    await tg.sendMessage(
+      chatId,
+      `🏁 Quiz finished!\n\n${lines}\n\n🎯 Scoreboard only — streaks are tracked in private quizzes.`
+    );
+
+    this.groupGames.delete(chatId);
   }
 
   private async registerUserIfNeeded(msg: MessageText): Promise<void> {
