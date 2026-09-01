@@ -166,16 +166,25 @@ async function callOpenRouter(payload: OpenRouterRequestBody): Promise<unknown> 
   return parseJsonContent(content);
 }
 
+function extractJsonObject(content: string): string | null {
+  // Strip markdown code fences (```json ... ```) if present.
+  const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1] : content;
+
+  const match = candidate.match(/\{[\s\S]*\}/);
+  return match ? match[0] : null;
+}
+
 function parseJsonContent(content: string): unknown {
   const trimmed = content.trim();
 
   try {
     return JSON.parse(trimmed);
   } catch {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-    if (match) {
+    const extracted = extractJsonObject(trimmed);
+    if (extracted) {
       try {
-        return JSON.parse(match[0]);
+        return JSON.parse(extracted);
       } catch {
         throw new AppError('Malformed AI JSON response', 502, 'INTERNAL_ERROR');
       }
