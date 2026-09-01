@@ -1,0 +1,26 @@
+{
+  "name": "bihar-stet-ai-quiz",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bihar STET Computer Science AI-powered daily quiz platform on Telegram",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w server && npm run build -w client",
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "build:server": "npm run build -w server",
+    "build:client": "npm run build -w client",
+    "test": "npm run test -w server",
+    "start": "npm run start -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

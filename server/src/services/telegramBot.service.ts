@@ -1,0 +1,447 @@
+import type { Message, CallbackQuery, Update } from './telegram.types';
+import { telegramService as tg } from './telegram.service';
+import { User } from '../models/User';
+import { DailyQuiz } from '../models/DailyQuiz';
+import { Question } from '../models/Question';
+import { QuizSession } from '../models/QuizSession';
+import { SessionStatus } from '../config/constants';
+import { UserStatistics } from '../models/UserStatistics';
+import { logger } from '../utils/logger';
+import { getDateKey } from '../utils/date';
+import {
+  startSession,
+  submitAnswer,
+  getOrCreateSession,
+} from './session.service';
+import { findActiveQuizForDate } from './quiz.service';
+
+const START_MESSAGE =
+  'Welcome to Bihar STET Computer Science Quiz!\n\n' +
+  'You will receive a daily Computer Science quiz every day at 8:00 PM IST.\n\n' +
+  'Use /quiz to start today\'s quiz manually.\n' +
+  'Use /score to see your performance.\n' +
+  'Use /streak to see your current streak.\n' +
+  'Use /help to see available commands.';
+
+const HELP_MESSAGE =
+  'Available commands:\n\n' +
+  '/start - Register and see welcome message\n' +
+  '/quiz - Start today\'s quiz manually\n' +
+  '/score - See your performance stats\n' +
+  '/streak - See your current daily streak\n' +
+  '/help - Show this help message\n\n' +
+  'You will also automatically receive a daily quiz every day at 8:00 PM IST.';
+
+type MessageText = Message & { text: string };
+
+export class TelegramBotHandler {
+  async handleUpdate(update: Update): Promise<void> {
+    if (update.message) {
+      await this.handleMessage(update.message);
+    } else if (update.callback_query) {
+      await this.handleCallbackQuery(update.callback_query);
+    }
+  }
+
+  private async handleMessage(message: Message): Promise<void> {
+    if (!('text' in message)) return;
+    const msg = message as MessageText;
+    const chatId = msg.chat.id;
+    const text = msg.text?.trim() ?? '';
+
+    await this.registerUserIfNeeded(msg);
+
+    if (text === '/start') {
+      await this.sendStart(chatId);
+    } else if (text === '/help') {
+      await this.sendHelp(chatId);
+    } else if (text === '/quiz') {
+      await this.sendQuiz(chatId, msg.from?.id);
+    } else if (text === '/score') {
+      await this.sendScore(chatId, msg.from?.id);
+    } else if (text === '/streak') {
+      await this.sendStreak(chatId, msg.from?.id);
+    } else if (text.startsWith('/')) {
+      await this.sendUnknown(chatId);
+    }
+  }
+
+  private async handleCallbackQuery(callback: CallbackQuery): Promise<void> {
+    const data = callback.data;
+    if (!data) return;
+
+    const fromId = callback.from?.id;
+    const chatId = callback.message?.chat?.id ?? fromId;
+    if (chatId === undefined) return;
+
+    if (data.startsWith('answer:')) {
+      await this.handleAnswer(callback, chatId, fromId, data);
+    } else if (data === 'next') {
+      await this.handleNext(callback, chatId, fromId);
+    } else if (data === 'finish') {
+      await this.handleFinish(callback, chatId, fromId);
+    }
+  }
+
+  private async registerUserIfNeeded(msg: MessageText): Promise<void> {
+    const from = msg.from;
+    if (!from) return;
+
+    const existing = await User.findOne({ telegramId: from.id });
+    if (existing) {
+      if (!existing.isActive) {
+        existing.isActive = true;
+        existing.blockedAt = null;
+        await existing.save();
+      }
+      return;
+    }
+
+    await User.create({
+      telegramId: from.id,
+      telegramUsername: from.username ?? null,
+      firstName: from.first_name ?? null,
+      lastName: from.last_name ?? null,
+      isActive: true,
+      isSubscribed: true,
+    });
+
+    logger.info('New Telegram user registered', {
+      telegramId: from.id,
+      username: from.username,
+    });
+  }
+
+  private async sendStart(chatId: number): Promise<void> {
+    await tg.sendMessage(chatId, START_MESSAGE);
+  }
+
+  private async sendHelp(chatId: number): Promise<void> {
+    await tg.sendMessage(chatId, HELP_MESSAGE);
+  }
+
+  private async sendUnknown(chatId: number): Promise<void> {
+    await tg.sendMessage(chatId, 'Unknown command. Use /help to see available commands.');
+  }
+
+  private async sendQuiz(chatId: number, telegramId?: number): Promise<void> {
+    if (!telegramId) return;
+
+    const user = await User.findOne({ telegramId });
+    if (!user) {
+      await tg.sendMessage(chatId, 'Please send /start first to register.');
+      return;
+    }
+
+    const today = getDateKey();
+    const quiz = await findActiveQuizForDate(today);
+
+    if (!quiz) {
+      await tg.sendMessage(
+        chatId,
+        'Today\'s quiz is not available yet. Please wait for today\'s 8:00 PM IST quiz or check back later.'
+      );
+      return;
+    }
+
+    const session = await startSession(String(user._id), String(quiz._id));
+
+    if (session.status === SessionStatus.COMPLETED) {
+      await tg.sendMessage(chatId, 'You have already completed today\'s quiz. See you tomorrow!');
+      return;
+    }
+
+    const questions = (quiz.questions ?? []) as any[];
+    const currentIndex = session.currentQuestion ?? 0;
+
+    if (session.status === SessionStatus.NOT_STARTED || currentIndex === 0) {
+      const started = await startSession(String(user._id), String(quiz._id));
+      await this.sendQuestion(chatId, String(user._id), String(quiz._id), started);
+    } else if (currentIndex >= questions.length) {
+      await this.showSummary(chatId, session);
+    } else {
+      await this.sendQuestion(chatId, String(user._id), String(quiz._id), session);
+    }
+  }
+
+  private async sendQuestion(
+    chatId: number,
+    _userId: string,
+    quizId: string,
+    session: any
+  ): Promise<void> {
+    const quiz = await DailyQuiz.findById(quizId).populate('questions').lean();
+    if (!quiz) return;
+
+    const questions = (quiz.questions ?? []) as any[];
+    const index = session.currentQuestion ?? 0;
+
+    if (index >= questions.length) {
+      await this.showSummary(chatId, session);
+      return;
+    }
+
+    const question = questions[index];
+    const questionDoc = await Question.findById(question).lean();
+    if (!questionDoc) {
+      await tg.sendMessage(chatId, 'There was a problem loading this question.');
+      return;
+    }
+
+    const total = session.totalQuestions || questions.length;
+    const optionRows = questionDoc.options.map((opt: string, i: number) => [
+      {
+        text: opt,
+        callback_data: `answer:${index}:${i}`,
+      },
+    ]);
+
+    const markup = {
+      inline_keyboard: optionRows,
+    };
+
+    const text =
+      `📚 Bihar STET Daily Quiz\n\n` +
+      `Question ${index + 1}/${total}\n\n` +
+      `${questionDoc.question}`;
+
+    await tg.sendMessage(chatId, text, { replyMarkup: markup });
+  }
+
+  private async handleAnswer(
+    callback: CallbackQuery,
+    chatId: number,
+    fromId: number | undefined,
+    data: string
+  ): Promise<void> {
+    const [, qIndexStr, optIndexStr] = data.split(':');
+    const qIndex = parseInt(qIndexStr, 10);
+    const optIndex = parseInt(optIndexStr, 10);
+
+    if (!fromId) return;
+    await tg.answerCallbackQuery(callback.id!);
+
+    const user = await User.findOne({ telegramId: fromId });
+    if (!user) {
+      await tg.sendMessage(chatId, 'Please send /start first to register.');
+      return;
+    }
+
+    const today = getDateKey();
+    const quiz = await findActiveQuizForDate(today);
+    if (!quiz) {
+      await tg.sendMessage(chatId, 'No active quiz found for today.');
+      return;
+    }
+
+    const questions = (quiz.questions ?? []) as any[];
+    if (qIndex >= questions.length) return;
+
+    const questionId = String(questions[qIndex]);
+    const question = await Question.findById(questionId).lean();
+    if (!question) return;
+
+    const selectedOption = question.options[optIndex];
+    if (selectedOption === undefined) return;
+
+    const result = await submitAnswer(String(user._id), String(quiz._id), questionId, selectedOption);
+
+    if (result.alreadyAnswered) {
+      await tg.sendMessage(chatId, 'You have already answered this question.');
+      const updated = await QuizSession.findById(result.session._id);
+      if (updated) await this.getAnswerFeedback(chatId, updated, quiz, qIndex);
+      return;
+    }
+
+    await this.getAnswerFeedback(chatId, result.session, quiz, qIndex);
+  }
+
+  private async getAnswerFeedback(
+    chatId: number,
+    session: any,
+    quiz: any,
+    qIndex: number
+  ): Promise<void> {
+    const questions = (quiz.questions ?? []) as any[];
+    const questionId = String(questions[qIndex]);
+    const question = await Question.findById(questionId).lean();
+    if (!question) return;
+
+    const answer = session.answers.find(
+      (a: any) => String(a.question) === String(questionId)
+    );
+
+    if (!answer) return;
+
+    let feedback: string;
+    if (answer.isCorrect) {
+      feedback =
+        `✅ Correct!\n\n` +
+        `${answer.correctAnswer}.\n\n` +
+        `${question.explanation}\n\n` +
+        `Score: ${session.score}/${session.totalQuestions}`;
+    } else {
+      feedback =
+        `❌ Incorrect\n\n` +
+        `Correct answer: ${answer.correctAnswer}\n\n` +
+        `${question.explanation}\n\n` +
+        `Score: ${session.score}/${session.totalQuestions}`;
+    }
+
+    const isLast = qIndex + 1 >= questions.length;
+
+    const markup = isLast
+      ? { inline_keyboard: [[{ text: '🎯 Finish Quiz', callback_data: 'finish' }]] }
+      : { inline_keyboard: [[{ text: 'Next Question ➡️', callback_data: 'next' }]] };
+
+    await tg.sendMessage(chatId, feedback, { replyMarkup: markup });
+  }
+
+  private async handleNext(
+    callback: CallbackQuery,
+    chatId: number,
+    fromId: number | undefined
+  ): Promise<void> {
+    await tg.answerCallbackQuery(callback.id!);
+
+    if (!fromId) return;
+    const user = await User.findOne({ telegramId: fromId });
+    if (!user) {
+      await tg.sendMessage(chatId, 'Please send /start first.');
+      return;
+    }
+
+    const today = getDateKey();
+    const quiz = await findActiveQuizForDate(today);
+    if (!quiz) {
+      await tg.sendMessage(chatId, 'No active quiz found for today.');
+      return;
+    }
+
+    const questions = (quiz.questions ?? []) as any[];
+    const session = await getOrCreateSession(String(user._id), String(quiz._id));
+
+    const currentIndex = session.currentQuestion ?? 0;
+    if (currentIndex >= questions.length) {
+      await this.showSummary(chatId, session);
+      return;
+    }
+
+    await this.sendQuestion(chatId, String(user._id), String(quiz._id), session);
+  }
+
+  private async handleFinish(
+    callback: CallbackQuery,
+    chatId: number,
+    fromId: number | undefined
+  ): Promise<void> {
+    await tg.answerCallbackQuery(callback.id!);
+
+    if (!fromId) return;
+    const user = await User.findOne({ telegramId: fromId });
+    if (!user) {
+      await tg.sendMessage(chatId, 'Please send /start first.');
+      return;
+    }
+
+    const today = getDateKey();
+    const quiz = await findActiveQuizForDate(today);
+    if (!quiz) return;
+
+    const { completeSession } = await import('./session.service');
+    const session = await completeSession(String(user._id), String(quiz._id));
+
+    await this.showSummary(chatId, session);
+  }
+
+  private async showSummary(chatId: number, session: any): Promise<void> {
+    const correct = session.answers.filter((a: any) => a.isCorrect).length;
+    const total = session.totalQuestions || session.answers.length;
+    const accuracy = total > 0 ? Math.round((correct / total) * 100) : 0;
+
+    await this.updateStreakForSummary(session);
+
+    const stats = await UserStatistics.findOne({ user: session.user });
+
+    let summary =
+      `🎯 Quiz Completed!\n\n` +
+      `Score: ${correct}/${total}\n` +
+      `Accuracy: ${accuracy}%\n`;
+
+    summary += `\n🔥 Current Streak: ${stats?.currentStreak ?? 0} days`;
+
+    await tg.sendMessage(chatId, summary);
+  }
+
+  private async updateStreakForSummary(session: any): Promise<void> {
+    await import('./session.service').then(async ({ completeSession }) => {
+      if (session.status !== SessionStatus.COMPLETED) {
+        await completeSession(String(session.user), String(session.dailyQuiz));
+      }
+    });
+  }
+
+  private async sendScore(chatId: number, telegramId?: number): Promise<void> {
+    if (!telegramId) return;
+    const user = await User.findOne({ telegramId });
+    if (!user) {
+      await tg.sendMessage(chatId, 'Please send /start first to register.');
+      return;
+    }
+
+    const stats = await UserStatistics.findOne({ user: user._id });
+
+    if (!stats || stats.totalQuestions === 0) {
+      await tg.sendMessage(chatId, 'You haven\'t completed any quizzes yet. Use /quiz to start!');
+      return;
+    }
+
+    const text =
+      `📊 Your Performance\n\n` +
+      `Total Quizzes: ${stats.totalQuizzes}\n` +
+      `Total Questions: ${stats.totalQuestions}\n` +
+      `Correct Answers: ${stats.correctAnswers}\n` +
+      `Wrong Answers: ${stats.wrongAnswers}\n` +
+      `Accuracy: ${stats.accuracy}%\n` +
+      `Average Score per Quiz: ${(stats.correctAnswers / (stats.totalQuizzes || 1)).toFixed(2)}\n` +
+      `Best Streak: ${stats.longestStreak} days`;
+
+    await tg.sendMessage(chatId, text);
+  }
+
+  private async sendStreak(chatId: number, telegramId?: number): Promise<void> {
+    if (!telegramId) return;
+    const user = await User.findOne({ telegramId });
+    if (!user) {
+      await tg.sendMessage(chatId, 'Please send /start first to register.');
+      return;
+    }
+
+    const stats = await UserStatistics.findOne({ user: user._id });
+    const streak = stats?.currentStreak ?? 0;
+    const longest = stats?.longestStreak ?? 0;
+
+    const flame = streak > 0 ? '🔥' : '';
+    const text =
+      `${flame} Current Streak: ${streak} day${streak === 1 ? '' : 's'}\n` +
+      `Longest Streak: ${longest} day${longest === 1 ? '' : 's'}\n\n` +
+      (streak > 0
+        ? 'Keep it up! Complete today\'s quiz to extend your streak.'
+        : 'Complete today\'s quiz to start a streak!');
+
+    await tg.sendMessage(chatId, text);
+  }
+
+  async deliverQuiz(telegramId: number): Promise<void> {
+    const today = getDateKey();
+    const quiz = await findActiveQuizForDate(today);
+    if (!quiz) return;
+
+    await this.sendQuiz(telegramId, telegramId);
+  }
+}
+
+export const telegramBotHandler = new TelegramBotHandler();
+export const startTelegramBot = () => {
+  // Bot logic driven by webhook; nothing to start in serverless mode.
+};
