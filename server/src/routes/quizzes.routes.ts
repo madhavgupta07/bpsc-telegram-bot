@@ -10,6 +10,7 @@ import {
   unpublishQuiz,
   replaceQuestion,
   getTodaysQuiz,
+  startQuiz,
   getTomorrowQuizStatus,
 } from '../controllers/quizzes.controller';
 import { requireAuth } from '../middleware/auth';
@@ -33,6 +34,7 @@ router.post('/generate', aiGenerationLimiter, validate(generateQuizSchema), gene
 router.post('/:date/regenerate', validate(quizParamsSchema), regenerateQuiz);
 router.patch('/:date/publish', validate(quizParamsSchema), publishQuiz);
 router.patch('/:date/unpublish', validate(quizParamsSchema), unpublishQuiz);
+router.post('/:date/start', validate(quizParamsSchema), startQuiz);
 router.post('/:date/replace-question', validate(quizParamsSchema), replaceQuestion);
 
 export default router;

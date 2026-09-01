@@ -159,6 +159,12 @@ export const api = {
   unpublishQuiz: (date: string) =>
     request<{ success: boolean }>(`/api/quizzes/${date}/unpublish`, { method: 'PATCH' }),
 
+  startQuiz: (date: string) =>
+    request<{ success: boolean; data: { attempted: number; delivered: number; failed: number } }>(
+      `/api/quizzes/${date}/start`,
+      { method: 'POST' }
+    ),
+
   todaysQuiz: () =>
     request<{ success: boolean; data: Quiz | null }>('/api/quizzes/today'),
 

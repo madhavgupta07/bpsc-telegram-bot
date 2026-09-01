@@ -11,18 +11,17 @@ export interface DeliveryResult {
   failed: number;
 }
 
-export async function deliverQuizzesForToday(): Promise<DeliveryResult> {
-  const today = getDateKey();
-  const quiz = await findActiveQuizForDate(today);
+export async function deliverQuizForDate(dateKey: string): Promise<DeliveryResult> {
+  const quiz = await findActiveQuizForDate(dateKey);
 
   if (!quiz) {
-    logger.warn(`[Delivery] No active quiz found for ${today}; skipping delivery.`);
+    logger.warn(`[Delivery] No active quiz found for ${dateKey}; skipping delivery.`);
     return { attempted: 0, delivered: 0, failed: 0 };
   }
 
   const users = await User.find({ isActive: true, isSubscribed: true }).lean();
   const total = users.length;
-  logger.info(`[Delivery] Found ${total} subscribed users for today's quiz ${quiz.date}`);
+  logger.info(`[Delivery] Found ${total} subscribed users for quiz ${quiz.date}`);
 
   let delivered = 0;
   let failed = 0;
@@ -45,6 +44,10 @@ export async function deliverQuizzesForToday(): Promise<DeliveryResult> {
   );
 
   return { attempted: total, delivered, failed };
+}
+
+export async function deliverQuizzesForToday(): Promise<DeliveryResult> {
+  return deliverQuizForDate(getDateKey());
 }
 
 export async function notifyQuizAvailable(chatId: number): Promise<void> {

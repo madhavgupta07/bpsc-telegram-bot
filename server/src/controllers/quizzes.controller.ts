@@ -12,6 +12,7 @@ import {
 } from '../config/constants';
 import { getDateKey, addDaysToDateKey } from '../utils/date';
 import { generateQuizForDate } from '../services/generation.service';
+import { deliverQuizForDate } from '../services/delivery.service';
 import { markQuestionsUsed } from '../services/quiz.service';
 import { findActiveQuizForDate } from '../services/quiz.service';
 
@@ -240,6 +241,35 @@ export const getTodaysQuiz = asyncHandler(async (_req: Request, res: Response) =
           questionCount: quiz.questions?.length ?? 0,
         }
       : null,
+  });
+});
+
+export const startQuiz = asyncHandler(async (req: Request, res: Response) => {
+  const { date } = req.params;
+
+  const quiz = await DailyQuiz.findOne({ date });
+  if (!quiz) throw new AppError('Quiz not found for this date', 404, 'QUIZ_NOT_FOUND');
+  if (quiz.status !== QuizStatus.PUBLISHED) {
+    throw new AppError(
+      `Quiz is ${quiz.status}. Publish it before starting delivery.`,
+      409,
+      'CONFLICT'
+    );
+  }
+  if (!quiz.questions || quiz.questions.length === 0) {
+    throw new AppError('Quiz has no questions to deliver', 409, 'CONFLICT');
+  }
+
+  const result = await deliverQuizForDate(date);
+
+  res.json({
+    success: true,
+    data: {
+      date,
+      attempted: result.attempted,
+      delivered: result.delivered,
+      failed: result.failed,
+    },
   });
 });
 

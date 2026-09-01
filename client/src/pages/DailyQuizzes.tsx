@@ -14,6 +14,7 @@ export default function DailyQuizzes() {
   const [data, setData] = useState<Paginated<Quiz> | null>(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [startingDate, setStartingDate] = useState<string | null>(null);
   const [detail, setDetail] = useState<QuizDetail | null>(null);
 
   const load = async (page = 1, limit = 25) => {
@@ -73,6 +74,22 @@ export default function DailyQuizzes() {
       setDetail(res.data as QuizDetail);
     } catch {
       toast('Failed to load quiz preview', 'error');
+    }
+  };
+
+  const handleStart = async (q: Quiz) => {
+    if (!window.confirm(`Send the ${q.date} quiz to all subscribed Telegram users now?`)) return;
+    setStartingDate(q.date);
+    try {
+      const res = await api.startQuiz(q.date);
+      toast(
+        `Delivered to ${res.data.delivered} of ${res.data.attempted} user(s)${res.data.failed ? ` (${res.data.failed} failed)` : ''}`,
+        res.data.failed ? 'error' : 'success'
+      );
+    } catch (err: any) {
+      toast(err?.message ?? 'Failed to start quiz', 'error');
+    } finally {
+      setStartingDate(null);
     }
   };
 
@@ -138,6 +155,15 @@ export default function DailyQuizzes() {
                     ) : (
                       <button className="btn btn-secondary btn-sm" onClick={() => handleUnpublish(q)}>
                         Unpublish
+                      </button>
+                    )}{' '}
+                    {q.status === 'PUBLISHED' && (
+                      <button
+                        className="btn btn-primary btn-sm"
+                        onClick={() => handleStart(q)}
+                        disabled={startingDate === q.date}
+                      >
+                        {startingDate === q.date ? 'Sending...' : '▶ Start Now'}
                       </button>
                     )}
                   </td>
