@@ -2,6 +2,8 @@ export interface Update {
   update_id: number;
   message?: Message;
   callback_query?: CallbackQuery;
+  poll?: Poll;
+  poll_answer?: PollAnswer;
 }
 
 export interface Message {
@@ -10,6 +12,7 @@ export interface Message {
   chat: Chat;
   date: number;
   text?: string;
+  poll?: Poll;
 }
 
 export interface Chat {
@@ -32,4 +35,26 @@ export interface CallbackQuery {
   from: TelegramUser;
   message?: Message;
   data?: string;
+}
+
+export interface PollOption {
+  text: string;
+  voter_count: number;
+}
+
+export interface Poll {
+  id: string;
+  question: string;
+  options: PollOption[];
+  total_voter_count: number;
+  is_closed: boolean;
+  is_anonymous: boolean;
+  type: 'regular' | 'quiz';
+  correct_option_id?: number;
+}
+
+export interface PollAnswer {
+  poll_id: string;
+  user: TelegramUser;
+  option_ids: number[];
 }

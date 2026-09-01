@@ -132,6 +132,40 @@ export class TelegramService {
     return this.call('getChatMember', { chat_id: chatId, user_id: userId });
   }
 
+  async sendPoll(
+    chatId: TelegramChatId,
+    question: string,
+    options: string[],
+    correctOptionId: number,
+    opts: {
+      explanation?: string;
+      openPeriod?: number;
+      isAnonymous?: boolean;
+    } = {}
+  ): Promise<any> {
+    const body: Record<string, unknown> = {
+      chat_id: chatId,
+      question,
+      options: JSON.stringify(options),
+      type: 'quiz',
+      correct_option_id: correctOptionId,
+      is_anonymous: opts.isAnonymous ?? false,
+    };
+    if (opts.explanation) body.explanation = opts.explanation;
+    if (opts.openPeriod) body.open_period = opts.openPeriod;
+
+    try {
+      return await this.call('sendPoll', body);
+    } catch (error) {
+      logger.error('Failed to send Telegram poll', error, { chatId });
+      throw error;
+    }
+  }
+
+  async stopPoll(chatId: TelegramChatId, messageId: number): Promise<any> {
+    return this.call('stopPoll', { chat_id: chatId, message_id: messageId });
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }

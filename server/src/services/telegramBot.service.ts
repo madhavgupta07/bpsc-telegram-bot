@@ -1,4 +1,4 @@
-import type { Message, CallbackQuery, Update } from './telegram.types';
+import type { Message, CallbackQuery, Update, PollAnswer } from './telegram.types';
 import { telegramService as tg } from './telegram.service';
 import { User } from '../models/User';
 import { DailyQuiz } from '../models/DailyQuiz';
@@ -33,32 +33,96 @@ const HELP_MESSAGE =
 
 type MessageText = Message & { text: string };
 
-const GROUP_QUESTION_TIMEOUT_MS = 10_000;
+/** Seconds each quiz poll stays open */
+const GROUP_QUESTION_OPEN_PERIOD = 15;
+/** Delay between poll close and next question (ms) */
+const NEXT_QUESTION_DELAY_MS = 2_000;
 
 type GroupMemberScore = {
   name: string;
+  username?: string;
   correct: number;
   answered: number;
+  firstAnswerAt: number;
+  lastAnswerAt: number;
 };
 
 type GroupGame = {
   quizId: string;
+  quizTitle: string;
   questions: any[];
   currentIndex: number;
   scores: Map<number, GroupMemberScore>;
   timer: NodeJS.Timeout | null;
+  /** Maps Telegram poll_id → question index in this game */
+  pollIdToIndex: Map<string, number>;
+  chatId: number;
+  startedAt: number;
 };
 
 export class TelegramBotHandler {
   private groupGames = new Map<number, GroupGame>();
+  /** Reverse lookup: poll_id → chatId so we can find the game from poll_answer updates */
+  private pollIdToChatId = new Map<string, number>();
 
   async handleUpdate(update: Update): Promise<void> {
-    if (update.message) {
+    if (update.poll_answer) {
+      await this.handlePollAnswer(update.poll_answer);
+    } else if (update.message) {
       await this.handleMessage(update.message);
     } else if (update.callback_query) {
       await this.handleCallbackQuery(update.callback_query);
     }
   }
+
+  // ─── Poll Answer Handler (native quiz polls) ─────────────────────────
+
+  private async handlePollAnswer(pollAnswer: PollAnswer): Promise<void> {
+    const { poll_id, user, option_ids } = pollAnswer;
+
+    const chatId = this.pollIdToChatId.get(poll_id);
+    if (chatId === undefined) return;
+
+    const game = this.groupGames.get(chatId);
+    if (!game) return;
+
+    const qIndex = game.pollIdToIndex.get(poll_id);
+    if (qIndex === undefined) return;
+
+    const questionDoc = game.questions[qIndex];
+    const question =
+      questionDoc._id && questionDoc.question
+        ? questionDoc
+        : await Question.findById(String(questionDoc._id || questionDoc)).lean();
+    if (!question) return;
+
+    // Determine if answer is correct
+    const correctOptionIndex = question.options.indexOf(question.correctAnswer);
+    const selectedIndex = option_ids[0];
+    const isCorrect = selectedIndex === correctOptionIndex;
+
+    const now = Date.now();
+    const existing = game.scores.get(user.id);
+
+    if (existing) {
+      // User already has a score entry — update it
+      existing.answered += 1;
+      if (isCorrect) existing.correct += 1;
+      existing.lastAnswerAt = now;
+    } else {
+      // First answer from this user
+      game.scores.set(user.id, {
+        name: user.first_name ?? `User ${user.id}`,
+        username: user.username,
+        correct: isCorrect ? 1 : 0,
+        answered: 1,
+        firstAnswerAt: now,
+        lastAnswerAt: now,
+      });
+    }
+  }
+
+  // ─── Message Handler ─────────────────────────────────────────────────
 
   private async handleMessage(message: Message): Promise<void> {
     if (!('text' in message)) return;
@@ -91,6 +155,8 @@ export class TelegramBotHandler {
     }
   }
 
+  // ─── Callback Query Handler (private DM quizzes) ────────────────────
+
   private async handleCallbackQuery(callback: CallbackQuery): Promise<void> {
     const data = callback.data;
     if (!data) return;
@@ -103,10 +169,10 @@ export class TelegramBotHandler {
       await this.handleAnswer(callback, chatId, fromId, data);
     } else if (data === 'finish') {
       await this.handleFinish(callback, chatId, fromId);
-    } else if (data.startsWith('group_answer:')) {
-      await this.handleGroupAnswer(callback, chatId, fromId, data);
     }
   }
+
+  // ─── Group Quiz Flow (Native Polls) ──────────────────────────────────
 
   private async handleGroupMessage(msg: MessageText): Promise<void> {
     const chatId = msg.chat.id;
@@ -164,22 +230,46 @@ export class TelegramBotHandler {
   }
 
   private async startGroupQuiz(chatId: number, quiz: any): Promise<void> {
+    // Clean up any existing game
     const existing = this.groupGames.get(chatId);
-    if (existing?.timer) clearTimeout(existing.timer);
-    if (existing) this.groupGames.delete(chatId);
+    if (existing) {
+      if (existing.timer) clearTimeout(existing.timer);
+      // Clean up poll lookups
+      for (const pollId of existing.pollIdToIndex.keys()) {
+        this.pollIdToChatId.delete(pollId);
+      }
+      this.groupGames.delete(chatId);
+    }
 
+    const quizTitle = quiz.title || quiz.date || 'BPSC Daily Quiz';
     const game: GroupGame = {
       quizId: String(quiz._id),
+      quizTitle,
       questions: (quiz.questions ?? []) as any[],
       currentIndex: 0,
       scores: new Map(),
       timer: null,
+      pollIdToIndex: new Map(),
+      chatId,
+      startedAt: Date.now(),
     };
 
     this.groupGames.set(chatId, game);
-    await tg.sendMessage(chatId, `🎮 Group Quiz starting! ${game.questions.length} questions, 10s each.`);
 
-    await this.postGroupQuestion(chatId, game);
+    await tg.sendMessage(
+      chatId,
+      `🎮 *Quiz Starting!*\n\n` +
+      `📝 ${game.questions.length} questions\n` +
+      `⏱ ${GROUP_QUESTION_OPEN_PERIOD} seconds per question\n` +
+      `🏆 Leaderboard at the end\n\n` +
+      `Get ready...`,
+      { parseMode: 'Markdown' }
+    );
+
+    // Small delay before first question
+    game.timer = setTimeout(() => {
+      this.postGroupQuestion(chatId, game).catch(() => undefined);
+    }, 2000);
   }
 
   private async postGroupQuestion(chatId: number, game: GroupGame): Promise<void> {
@@ -203,111 +293,105 @@ export class TelegramBotHandler {
       return;
     }
 
-    const optionRows = question.options.map((opt: string, i: number) => [
-      {
-        text: opt,
-        callback_data: `group_answer:${game.quizId}:${index}:${i}`,
-      },
-    ]);
+    // Find the index of the correct answer in options array
+    const correctOptionIndex = question.options.indexOf(question.correctAnswer);
+    if (correctOptionIndex === -1) {
+      logger.error('Correct answer not found in options', { questionId: question._id });
+      game.currentIndex += 1;
+      await this.postGroupQuestion(chatId, game);
+      return;
+    }
 
-    const text =
-      `📚 Bihar STET Quiz — Question ${index + 1}/${questions.length}\n` +
-      `⏱ You have ${GROUP_QUESTION_TIMEOUT_MS / 1000}s. Tap your answer once!\n\n` +
-      `${question.question}`;
+    const pollQuestion = `[${index + 1}/${questions.length}] ${question.question}`;
 
-    await tg.sendMessage(chatId, text, {
-      replyMarkup: { inline_keyboard: optionRows },
-    });
+    try {
+      const result = await tg.sendPoll(
+        chatId,
+        pollQuestion,
+        question.options,
+        correctOptionIndex,
+        {
+          explanation: question.explanation || undefined,
+          openPeriod: GROUP_QUESTION_OPEN_PERIOD,
+          isAnonymous: false,
+        }
+      );
 
+      // Track this poll for answer lookups
+      const pollId = result?.result?.poll?.id;
+      if (pollId) {
+        game.pollIdToIndex.set(pollId, index);
+        this.pollIdToChatId.set(pollId, chatId);
+      }
+    } catch (error) {
+      logger.error('Failed to send quiz poll', error);
+    }
+
+    // Schedule next question after poll closes
     game.timer = setTimeout(() => {
       game.currentIndex += 1;
       this.postGroupQuestion(chatId, game).catch(() => undefined);
-    }, GROUP_QUESTION_TIMEOUT_MS);
-  }
-
-  private async handleGroupAnswer(
-    callback: CallbackQuery,
-    chatId: number,
-    fromId: number | undefined,
-    data: string
-  ): Promise<void> {
-    const [, , qIndexStr, optIndexStr] = data.split(':');
-    const qIndex = parseInt(qIndexStr, 10);
-    const optIndex = parseInt(optIndexStr, 10);
-
-    if (fromId === undefined) return;
-
-    const game = this.groupGames.get(chatId);
-    if (!game || qIndex !== game.currentIndex) {
-      await tg.answerCallbackQuery(callback.id!, {
-        text: 'Too late or this question has closed.',
-        showAlert: true,
-      });
-      return;
-    }
-
-    const questionDoc = game.questions[qIndex];
-    const question =
-      questionDoc._id && questionDoc.question
-        ? questionDoc
-        : await Question.findById(String(questionDoc._id || questionDoc)).lean();
-    if (!question) return;
-
-    const selectedOption = question.options?.[optIndex];
-    if (selectedOption === undefined) return;
-
-    const existing = game.scores.get(fromId);
-    if (existing && existing.answered > qIndex) {
-      await tg.answerCallbackQuery(callback.id!, {
-        text: 'You already answered this question.',
-        showAlert: true,
-      });
-      return;
-    }
-
-    const isCorrect = selectedOption === question.correctAnswer;
-
-    await tg.answerCallbackQuery(callback.id!, {
-      text: isCorrect ? '✅ Correct!' : '❌ Incorrect',
-    });
-
-    const member = callback.from;
-    const memberScore = game.scores.get(fromId) ?? {
-      name: member.first_name ?? `User ${fromId}`,
-      correct: 0,
-      answered: 0,
-    };
-
-    memberScore.answered += 1;
-    if (isCorrect) memberScore.correct += 1;
-    game.scores.set(fromId, memberScore);
+    }, (GROUP_QUESTION_OPEN_PERIOD * 1000) + NEXT_QUESTION_DELAY_MS);
   }
 
   private async postGroupScoreboard(chatId: number, game: GroupGame): Promise<void> {
     if (game.timer) clearTimeout(game.timer);
     game.timer = null;
 
-    const sorted = [...game.scores.entries()].sort((a, b) => b[1].correct - a[1].correct);
+    const sorted = [...game.scores.entries()].sort((a, b) => {
+      // Sort by correct answers DESC
+      if (b[1].correct !== a[1].correct) return b[1].correct - a[1].correct;
+      // Tie-break by time ASC (faster = better)
+      const aTime = a[1].lastAnswerAt - game.startedAt;
+      const bTime = b[1].lastAnswerAt - game.startedAt;
+      return aTime - bTime;
+    });
+
+    const medals = ['🥇', '🥈', '🥉'];
 
     let lines: string;
     if (sorted.length === 0) {
-      lines = '🎯 No one participated this round.';
+      lines = 'No one participated this round.';
     } else {
       lines = sorted
-        .map(
-          (entry, i) =>
-            `${i + 1}. ${entry[1].name} — ${entry[1].correct} correct`
-        )
+        .map((entry, i) => {
+          const score = entry[1];
+          const timeTakenMs = score.lastAnswerAt - game.startedAt;
+          const timeStr = this.formatDuration(timeTakenMs);
+          const displayName = score.username
+            ? `@${score.username}`
+            : score.name;
+          const rank = i < 3 ? medals[i] : `${i + 1}.`;
+          return `${rank} ${displayName} — ${score.correct} (${timeStr})`;
+        })
         .join('\n');
     }
 
     await tg.sendMessage(
       chatId,
-      `🏁 Quiz finished!\n\n${lines}\n\n🎯 Scoreboard only — streaks are tracked in private quizzes.`
+      `🏁 The quiz '${game.quizTitle}' has finished!\n\n` +
+      `${game.questions.length} questions answered\n\n` +
+      `${lines}`
     );
 
+    // Clean up poll lookups
+    for (const pollId of game.pollIdToIndex.keys()) {
+      this.pollIdToChatId.delete(pollId);
+    }
     this.groupGames.delete(chatId);
   }
+
+  private formatDuration(ms: number): string {
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes > 0) {
+      return `${minutes} min ${seconds} sec`;
+    }
+    return `${seconds} sec`;
+  }
+
+  // ─── User Registration ───────────────────────────────────────────────
 
   private async registerUserIfNeeded(msg: MessageText): Promise<void> {
     const from = msg.from;
@@ -338,6 +422,8 @@ export class TelegramBotHandler {
     });
   }
 
+  // ─── Private Chat Commands ───────────────────────────────────────────
+
   private async sendStart(chatId: number): Promise<void> {
     await tg.sendMessage(chatId, START_MESSAGE);
   }
@@ -349,6 +435,8 @@ export class TelegramBotHandler {
   private async sendUnknown(chatId: number): Promise<void> {
     await tg.sendMessage(chatId, 'Unknown command. Use /help to see available commands.');
   }
+
+  // ─── Private DM Quiz Flow (inline keyboards, unchanged) ─────────────
 
   private async sendQuiz(chatId: number, telegramId?: number, quiz?: any): Promise<void> {
     if (!telegramId) return;
