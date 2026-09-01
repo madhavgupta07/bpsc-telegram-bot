@@ -71,6 +71,7 @@ export const generateQuizSchema = z.object({
         hard: z.number().min(0).max(1).optional(),
       })
       .optional(),
+    regenerate: z.boolean().optional().default(false),
   }),
 });
 
