@@ -6,7 +6,7 @@ import {
   type ReactNode,
 } from 'react';
 
-import { api } from '../services/api';
+import { api, setAuthToken } from '../services/api';
 import type { AdminUser } from '../types';
 
 interface AuthContextValue {
@@ -32,11 +32,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = async (username: string, password: string) => {
     const res = await api.login(username, password);
+    setAuthToken(res.data.token);
     setAdmin(res.data.admin);
   };
 
   const logout = async () => {
-    await api.logout().catch(() => undefined);
+    try {
+      await api.logout();
+    } catch {
+      /* ignore logout errors */
+    }
+    setAuthToken(null);
     setAdmin(null);
   };
 

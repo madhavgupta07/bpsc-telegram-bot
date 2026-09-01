@@ -13,6 +13,20 @@ import type {
 
 export const API_BASE = import.meta.env.VITE_API_URL ?? '';
 
+const TOKEN_KEY = 'bpsc_admin_token';
+
+export function getAuthToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setAuthToken(token: string | null): void {
+  if (token) {
+    localStorage.setItem(TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(TOKEN_KEY);
+  }
+}
+
 export class ApiError extends Error {
   status: number;
   errorCode: string;
@@ -31,9 +45,14 @@ async function request<T>(
   options: RequestInit = {}
 ): Promise<T> {
   const headers: Record<string, string> = {
-    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+    'Content-Type': options.body ? 'application/json' : 'application/json',
     ...(options.headers as Record<string, string>),
   };
+
+  const token = getAuthToken();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
 
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
