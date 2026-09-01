@@ -28,7 +28,7 @@ export async function deliverQuizForDate(dateKey: string): Promise<DeliveryResul
 
   for (const user of users) {
     try {
-      await telegramBotHandler.deliverQuiz(user.telegramId);
+      await telegramBotHandler.deliverQuiz(user.telegramId, quiz);
       delivered += 1;
     } catch (error) {
       failed += 1;

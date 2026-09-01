@@ -11,7 +11,6 @@ import { getDateKey } from '../utils/date';
 import {
   startSession,
   submitAnswer,
-  getOrCreateSession,
 } from './session.service';
 import { findActiveQuizForDate } from './quiz.service';
 
@@ -76,8 +75,6 @@ export class TelegramBotHandler {
 
     if (data.startsWith('answer:')) {
       await this.handleAnswer(callback, chatId, fromId, data);
-    } else if (data === 'next') {
-      await this.handleNext(callback, chatId, fromId);
     } else if (data === 'finish') {
       await this.handleFinish(callback, chatId, fromId);
     }
@@ -124,7 +121,7 @@ export class TelegramBotHandler {
     await tg.sendMessage(chatId, 'Unknown command. Use /help to see available commands.');
   }
 
-  private async sendQuiz(chatId: number, telegramId?: number): Promise<void> {
+  private async sendQuiz(chatId: number, telegramId?: number, quiz?: any): Promise<void> {
     if (!telegramId) return;
 
     const user = await User.findOne({ telegramId });
@@ -133,43 +130,41 @@ export class TelegramBotHandler {
       return;
     }
 
-    const today = getDateKey();
-    const quiz = await findActiveQuizForDate(today);
+    let activeQuiz = quiz;
+    if (!activeQuiz) {
+      const today = getDateKey();
+      activeQuiz = await findActiveQuizForDate(today);
+    }
 
-    if (!quiz) {
+    if (!activeQuiz) {
       await tg.sendMessage(
         chatId,
-        'Today\'s quiz is not available yet. Please wait for today\'s 8:00 PM IST quiz or check back later.'
+        'No quiz is available right now. Please check back later or start one from the admin dashboard.'
       );
       return;
     }
 
-    const session = await startSession(String(user._id), String(quiz._id));
+    const session = await startSession(String(user._id), String(activeQuiz._id));
 
     if (session.status === SessionStatus.COMPLETED) {
-      await tg.sendMessage(chatId, 'You have already completed today\'s quiz. See you tomorrow!');
+      await tg.sendMessage(chatId, 'You have already completed this quiz. See you tomorrow!');
       return;
     }
 
-    const questions = (quiz.questions ?? []) as any[];
+    const questions = (activeQuiz.questions ?? []) as any[];
     const currentIndex = session.currentQuestion ?? 0;
 
     if (session.status === SessionStatus.NOT_STARTED || currentIndex === 0) {
-      const started = await startSession(String(user._id), String(quiz._id));
-      await this.sendQuestion(chatId, String(user._id), String(quiz._id), started);
+      const started = await startSession(String(user._id), String(activeQuiz._id));
+      await this.sendQuestion(chatId, String(activeQuiz._id), started);
     } else if (currentIndex >= questions.length) {
       await this.showSummary(chatId, session);
     } else {
-      await this.sendQuestion(chatId, String(user._id), String(quiz._id), session);
+      await this.sendQuestion(chatId, String(activeQuiz._id), session);
     }
   }
 
-  private async sendQuestion(
-    chatId: number,
-    _userId: string,
-    quizId: string,
-    session: any
-  ): Promise<void> {
+  private async sendQuestion(chatId: number, quizId: string, session: any): Promise<void> {
     const quiz = await DailyQuiz.findById(quizId).populate('questions').lean();
     if (!quiz) return;
 
@@ -181,18 +176,23 @@ export class TelegramBotHandler {
       return;
     }
 
-    const question = questions[index];
-    const questionDoc = await Question.findById(question).lean();
-    if (!questionDoc) {
+    const questionDoc = questions[index];
+    const questionId = String(questionDoc._id || questionDoc);
+    const question =
+      questionDoc._id && questionDoc.question
+        ? questionDoc
+        : await Question.findById(questionId).lean();
+
+    if (!question || !question.question) {
       await tg.sendMessage(chatId, 'There was a problem loading this question.');
       return;
     }
 
     const total = session.totalQuestions || questions.length;
-    const optionRows = questionDoc.options.map((opt: string, i: number) => [
+    const optionRows = question.options.map((opt: string, i: number) => [
       {
         text: opt,
-        callback_data: `answer:${index}:${i}`,
+        callback_data: `answer:${quizId}:${index}:${i}`,
       },
     ]);
 
@@ -203,7 +203,7 @@ export class TelegramBotHandler {
     const text =
       `📚 Bihar STET Daily Quiz\n\n` +
       `Question ${index + 1}/${total}\n\n` +
-      `${questionDoc.question}`;
+      `${question.question}`;
 
     await tg.sendMessage(chatId, text, { replyMarkup: markup });
   }
@@ -214,7 +214,7 @@ export class TelegramBotHandler {
     fromId: number | undefined,
     data: string
   ): Promise<void> {
-    const [, qIndexStr, optIndexStr] = data.split(':');
+    const [, quizId, qIndexStr, optIndexStr] = data.split(':');
     const qIndex = parseInt(qIndexStr, 10);
     const optIndex = parseInt(optIndexStr, 10);
 
@@ -227,33 +227,34 @@ export class TelegramBotHandler {
       return;
     }
 
-    const today = getDateKey();
-    const quiz = await findActiveQuizForDate(today);
+    const quiz = await DailyQuiz.findById(quizId).populate('questions').lean();
     if (!quiz) {
-      await tg.sendMessage(chatId, 'No active quiz found for today.');
+      await tg.sendMessage(chatId, 'This quiz is no longer available.');
       return;
     }
 
     const questions = (quiz.questions ?? []) as any[];
-    if (qIndex >= questions.length) return;
+    if (qIndex < 0 || qIndex >= questions.length) return;
 
-    const questionId = String(questions[qIndex]);
-    const question = await Question.findById(questionId).lean();
+    const questionDoc = questions[qIndex];
+    const questionId = String(questionDoc._id || questionDoc);
+    const question =
+      questionDoc._id && questionDoc.question
+        ? questionDoc
+        : await Question.findById(questionId).lean();
     if (!question) return;
 
-    const selectedOption = question.options[optIndex];
+    const selectedOption = question.options?.[optIndex];
     if (selectedOption === undefined) return;
 
     const result = await submitAnswer(String(user._id), String(quiz._id), questionId, selectedOption);
 
-    if (result.alreadyAnswered) {
-      await tg.sendMessage(chatId, 'You have already answered this question.');
-      const updated = await QuizSession.findById(result.session._id);
-      if (updated) await this.getAnswerFeedback(chatId, updated, quiz, qIndex);
-      return;
-    }
+    const session =
+      result.session && result.session._id
+        ? result.session
+        : await QuizSession.findOne({ user: user._id, dailyQuiz: quiz._id });
 
-    await this.getAnswerFeedback(chatId, result.session, quiz, qIndex);
+    await this.getAnswerFeedback(chatId, session, quiz, qIndex);
   }
 
   private async getAnswerFeedback(
@@ -263,11 +264,15 @@ export class TelegramBotHandler {
     qIndex: number
   ): Promise<void> {
     const questions = (quiz.questions ?? []) as any[];
-    const questionId = String(questions[qIndex]);
-    const question = await Question.findById(questionId).lean();
+    const questionDoc = questions[qIndex];
+    const questionId = String(questionDoc._id || questionDoc);
+    const question =
+      questionDoc._id && questionDoc.question
+        ? questionDoc
+        : await Question.findById(questionId).lean();
     if (!question) return;
 
-    const answer = session.answers.find(
+    const answer = (session.answers ?? []).find(
       (a: any) => String(a.question) === String(questionId)
     );
 
@@ -278,56 +283,24 @@ export class TelegramBotHandler {
       feedback =
         `✅ Correct!\n\n` +
         `${answer.correctAnswer}.\n\n` +
-        `${question.explanation}\n\n` +
-        `Score: ${session.score}/${session.totalQuestions}`;
+        `${question.explanation ?? ''}\n\n` +
+        `Score: ${session.score}/${session.totalQuestions || questions.length}`;
     } else {
       feedback =
         `❌ Incorrect\n\n` +
         `Correct answer: ${answer.correctAnswer}\n\n` +
-        `${question.explanation}\n\n` +
-        `Score: ${session.score}/${session.totalQuestions}`;
+        `${question.explanation ?? ''}\n\n` +
+        `Score: ${session.score}/${session.totalQuestions || questions.length}`;
     }
 
-    const isLast = qIndex + 1 >= questions.length;
+    await tg.sendMessage(chatId, feedback);
 
-    const markup = isLast
-      ? { inline_keyboard: [[{ text: '🎯 Finish Quiz', callback_data: 'finish' }]] }
-      : { inline_keyboard: [[{ text: 'Next Question ➡️', callback_data: 'next' }]] };
-
-    await tg.sendMessage(chatId, feedback, { replyMarkup: markup });
-  }
-
-  private async handleNext(
-    callback: CallbackQuery,
-    chatId: number,
-    fromId: number | undefined
-  ): Promise<void> {
-    await tg.answerCallbackQuery(callback.id!);
-
-    if (!fromId) return;
-    const user = await User.findOne({ telegramId: fromId });
-    if (!user) {
-      await tg.sendMessage(chatId, 'Please send /start first.');
-      return;
-    }
-
-    const today = getDateKey();
-    const quiz = await findActiveQuizForDate(today);
-    if (!quiz) {
-      await tg.sendMessage(chatId, 'No active quiz found for today.');
-      return;
-    }
-
-    const questions = (quiz.questions ?? []) as any[];
-    const session = await getOrCreateSession(String(user._id), String(quiz._id));
-
-    const currentIndex = session.currentQuestion ?? 0;
-    if (currentIndex >= questions.length) {
+    const nextIndex = qIndex + 1;
+    if (nextIndex < questions.length) {
+      await this.sendQuestion(chatId, String(quiz._id), { ...session, currentQuestion: nextIndex });
+    } else {
       await this.showSummary(chatId, session);
-      return;
     }
-
-    await this.sendQuestion(chatId, String(user._id), String(quiz._id), session);
   }
 
   private async handleFinish(
@@ -344,14 +317,17 @@ export class TelegramBotHandler {
       return;
     }
 
-    const today = getDateKey();
-    const quiz = await findActiveQuizForDate(today);
-    if (!quiz) return;
+    const session = await QuizSession.findOne({ user: user._id, status: SessionStatus.IN_PROGRESS })
+      .sort({ startedAt: -1 });
+    if (!session) {
+      await tg.sendMessage(chatId, 'No active quiz in progress.');
+      return;
+    }
 
     const { completeSession } = await import('./session.service');
-    const session = await completeSession(String(user._id), String(quiz._id));
+    const completed = await completeSession(String(user._id), String(session.dailyQuiz));
 
-    await this.showSummary(chatId, session);
+    await this.showSummary(chatId, completed);
   }
 
   private async showSummary(chatId: number, session: any): Promise<void> {
@@ -432,12 +408,15 @@ export class TelegramBotHandler {
     await tg.sendMessage(chatId, text);
   }
 
-  async deliverQuiz(telegramId: number): Promise<void> {
-    const today = getDateKey();
-    const quiz = await findActiveQuizForDate(today);
-    if (!quiz) return;
+  async deliverQuiz(telegramId: number, quiz?: any): Promise<void> {
+    let targetQuiz = quiz;
+    if (!targetQuiz) {
+      const today = getDateKey();
+      targetQuiz = await findActiveQuizForDate(today);
+    }
+    if (!targetQuiz) return;
 
-    await this.sendQuiz(telegramId, telegramId);
+    await this.sendQuiz(telegramId, telegramId, targetQuiz);
   }
 }
 
