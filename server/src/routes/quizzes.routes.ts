@@ -12,6 +12,7 @@ import {
   getTodaysQuiz,
   startQuiz,
   getTomorrowQuizStatus,
+  getTopicQuestionCounts,
 } from '../controllers/quizzes.controller';
 import { requireAuth } from '../middleware/auth';
 import { apiLimiter, aiGenerationLimiter } from '../middleware/rateLimiter';
@@ -28,6 +29,7 @@ router.use(requireAuth, apiLimiter);
 router.get('/', listQuizzes);
 router.get('/today', getTodaysQuiz);
 router.get('/tomorrow', getTomorrowQuizStatus);
+router.get('/topic-counts', getTopicQuestionCounts);
 router.get('/:date', validate(quizParamsSchema), getQuiz);
 router.get('/:date/preview', validate(quizParamsSchema), previewQuiz);
 router.post('/generate', aiGenerationLimiter, validate(generateQuizSchema), generateQuiz);

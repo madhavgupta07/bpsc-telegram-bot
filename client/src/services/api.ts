@@ -147,11 +147,20 @@ export const api = {
       `/api/quizzes/${date}`
     ),
 
-  generateQuiz: (body: Record<string, unknown>) =>
+  generateQuiz: (body: {
+    date?: string;
+    totalQuestions?: number;
+    topicDistribution?: Record<string, number>;
+    difficultyDistribution?: Record<string, number>;
+    regenerate?: boolean;
+  }) =>
     request<{ success: boolean; data: { id: string } }>('/api/quizzes/generate', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  topicQuestionCounts: () =>
+    request<{ success: boolean; data: Record<string, number> }>('/api/quizzes/topic-counts'),
 
   publishQuiz: (date: string) =>
     request<{ success: boolean }>(`/api/quizzes/${date}/publish`, { method: 'PATCH' }),

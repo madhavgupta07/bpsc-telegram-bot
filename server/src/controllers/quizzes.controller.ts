@@ -289,3 +289,19 @@ export const getTomorrowQuizStatus = asyncHandler(async (_req: Request, res: Res
       : null,
   });
 });
+
+export const getTopicQuestionCounts = asyncHandler(async (_req: Request, res: Response) => {
+  const counts = await Question.aggregate([
+    { $match: { isActive: true } },
+    { $group: { _id: '$topic', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+  ]);
+
+  const result: Record<string, number> = {};
+  for (const entry of counts) {
+    result[entry._id] = entry.count;
+  }
+
+  res.json({ success: true, data: result });
+});
+
