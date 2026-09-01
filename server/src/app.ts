@@ -17,6 +17,9 @@ import { notFoundHandler, errorHandler } from './middleware/errorHandler';
 export function createApp(): Application {
   const app = express();
 
+  // Trust first proxy (Render, Heroku, etc.) so rate-limiter reads X-Forwarded-For correctly
+  app.set('trust proxy', 1);
+
   app.use(
     helmet({
       crossOriginResourcePolicy: { policy: 'cross-origin' },
